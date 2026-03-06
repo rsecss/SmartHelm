@@ -1,172 +1,201 @@
 #include "mpu6050.h"
+#include "mpu6050_inv_mpu.h"
+#include "mpu6050_inv_mpu_dmp_motion_driver.h"
 
-uint8_t i = 10;                     // 循环计数器
-float pitch, roll, yaw;             // 欧拉角（姿态数据）
-short aacx, aacy, aacz;             // 加速度计原始数据
-short gyrox, gyroy, gyroz;          // 陀螺仪原始数据
-unsigned long walk;                 // 步数
-float steplength = 0.3, Distance;   // 步距和路程计算参数
-uint8_t svm_set = 1;                // 路程计算标志
-uint16_t AVM;                       // 加速度向量模值
-uint16_t GVM;                       // 陀螺仪向量模值
-bool fall_flag = 0;                 // 跌倒标志位
-bool collision_flag = 0;            // 碰撞标志位
+extern I2C_HandleTypeDef hi2c1;
+
+/* 姿态数据 */
+float pitch, roll, yaw;
+
+/* 传感器原始值 */
+short aacx, aacy, aacz;
+short gyrox, gyroy, gyroz;
+
+/* 向量模值 */
+uint16_t AVM;
+uint16_t GVM;
+
+/* 跌倒标志 */
+bool fall_flag = 0;
+
+/* q30 格式转 float 的除数 */
+#define Q30 1073741824.0f
+
+/* 陀螺仪安装方向矩阵 */
+static signed char gyro_orientation[9] = {
+    1, 0, 0,
+    0, 1, 0,
+    0, 0, 1
+};
 
 /**
- * @brief  I2C 写操作函数，用于向 MPU6050 写入多个字节数据
+ * @brief  行向量转 DMP 方向标量
  */
-uint8_t MPU_Write_Len(uint8_t addr, uint8_t reg, uint8_t len, uint8_t *buf)
+static unsigned short inv_row_2_scale(const signed char *row)
 {
-    uint8_t data[1 + len]; // 组合数据缓冲区，第一个字节为寄存器地址
-    data[0] = reg;
-    for (uint8_t i = 0; i < len; i++)
-        data[i + 1] = buf[i];
+    unsigned short b;
 
-    // 通过 I2C 发送数据
-    if (HAL_I2C_Master_Transmit(&hi2c1, (addr << 1), data, len + 1, HAL_MAX_DELAY) != HAL_OK)
-        return 1; // 传输失败
-    return 0;     // 传输成功
+    if (row[0] > 0)
+        b = 0;
+    else if (row[0] < 0)
+        b = 4;
+    else if (row[1] > 0)
+        b = 1;
+    else if (row[1] < 0)
+        b = 5;
+    else if (row[2] > 0)
+        b = 2;
+    else if (row[2] < 0)
+        b = 6;
+    else
+        b = 7;
+    return b;
 }
 
 /**
- * @brief  I2C 读操作函数，用于从 MPU6050 读取多个字节数据
+ * @brief  方向矩阵转 DMP 标量
  */
-uint8_t MPU_Read_Len(uint8_t addr, uint8_t reg, uint8_t len, uint8_t *buf)
+static unsigned short inv_orientation_matrix_to_scalar(const signed char *mtx)
 {
-    // 发送寄存器地址
-    if (HAL_I2C_Master_Transmit(&hi2c1, (addr << 1), &reg, 1, HAL_MAX_DELAY) != HAL_OK)
-        return 1; // 发送寄存器地址失败
+    unsigned short scalar;
 
-    // 读取数据
-    if (HAL_I2C_Master_Receive(&hi2c1, (addr << 1), buf, len, HAL_MAX_DELAY) != HAL_OK)
-        return 1; // 读取数据失败
-    return 0;     // 读取成功
+    scalar  = inv_row_2_scale(mtx);
+    scalar |= inv_row_2_scale(mtx + 3) << 3;
+    scalar |= inv_row_2_scale(mtx + 6) << 6;
+
+    return scalar;
 }
 
 /**
- * @brief  向 MPU6050 写入单个字节数据
+ * @brief  执行自检并将偏置写入 DMP
  */
-uint8_t MPU_Write_Byte(uint8_t reg, uint8_t data)
+static uint8_t run_self_test(void)
 {
-    uint8_t buf[2] = {reg, data};
-    if (HAL_I2C_Master_Transmit(&hi2c1, (MPU_ADDR << 1), buf, 2, HAL_MAX_DELAY) != HAL_OK)
-    {
-        return 1; // 传输失败
-    }
-    return 0; // 传输成功
+    int result;
+    long gyro[3], accel[3];
+    float sens;
+    unsigned short accel_sens;
+
+    result = mpu_run_self_test(gyro, accel);
+
+    mpu_get_gyro_sens(&sens);
+    gyro[0] = (long)(gyro[0] * sens);
+    gyro[1] = (long)(gyro[1] * sens);
+    gyro[2] = (long)(gyro[2] * sens);
+    dmp_set_gyro_bias(gyro);
+
+    mpu_get_accel_sens(&accel_sens);
+    accel[0] *= accel_sens;
+    accel[1] *= accel_sens;
+    accel[2] *= accel_sens;
+    dmp_set_accel_bias(accel);
+
+    return (result == 0x3) ? 0 : 1;
 }
 
 /**
- * @brief  从 MPU6050 读取单个字节数据
+ * @brief  MPU6050 完整初始化（含 DMP 固件加载、自检、校准）
  */
-uint8_t MPU_Read_Byte(uint8_t reg)
+void mpu6050_init(void)
 {
-    uint8_t data;
-    // 发送寄存器地址
-    if (HAL_I2C_Master_Transmit(&hi2c1, (MPU_ADDR << 1), &reg, 1, HAL_MAX_DELAY) != HAL_OK)
-    {
-        return 0; // 传输失败
-    }
+    struct int_param_s int_param;
 
-    // 读取数据
-    if (HAL_I2C_Master_Receive(&hi2c1, (MPU_ADDR << 1), &data, 1, HAL_MAX_DELAY) != HAL_OK)
-    {
-        return 0; // 读取失败
-    }
-    return data; // 返回读取的数据
+    if (mpu_init(&int_param) != 0)
+        return;
+    if (mpu_set_sensors(INV_XYZ_GYRO | INV_XYZ_ACCEL))
+        return;
+    if (mpu_configure_fifo(INV_XYZ_GYRO | INV_XYZ_ACCEL))
+        return;
+    if (mpu_set_sample_rate(DEFAULT_MPU_HZ))
+        return;
+    if (dmp_load_motion_driver_firmware())
+        return;
+    if (dmp_set_orientation(inv_orientation_matrix_to_scalar(gyro_orientation)))
+        return;
+    if (dmp_enable_feature(DMP_FEATURE_6X_LP_QUAT | DMP_FEATURE_TAP |
+                           DMP_FEATURE_ANDROID_ORIENT | DMP_FEATURE_SEND_RAW_ACCEL |
+                           DMP_FEATURE_SEND_CAL_GYRO | DMP_FEATURE_GYRO_CAL))
+        return;
+    if (dmp_set_fifo_rate(DEFAULT_MPU_HZ))
+        return;
+
+    run_self_test(); // 自检（失败不阻塞，仅影响校准精度）
+
+    mpu_set_dmp_state(1);
 }
 
 /**
- * @brief  初始化 MPU6050 函数
+ * @brief  DMP 姿态解算，从 FIFO 读取四元数并转换为欧拉角
  */
-void MPU_Init(void)
+uint8_t mpu6050_dmp_get_data(float *p, float *r, float *y)
 {
-    // 解除 MPU6050 休眠状态
-    MPU_Write_Byte(MPU_PWR_MGMT1_REG, 0x00);
-    // 设置陀螺仪采样率（典型值 125Hz）
-    MPU_Write_Byte(MPU_SAMPLE_RATE_REG, 0x07);
-    // 设置低通滤波器频率（典型值 5Hz）
-    MPU_Write_Byte(MPU_CFG_REG, 0x06);
-    // 配置陀螺仪（不自检，量程 2000deg/s）
-    MPU_Write_Byte(MPU_GYRO_CFG_REG, 0x18);
-    // 配置加速度计（不自检，量程 2G，低通滤波 5Hz）
-    MPU_Write_Byte(MPU_ACCEL_CFG_REG, 0x01);
+    float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
+    unsigned long sensor_timestamp;
+    short gyro[3], accel[3], sensors;
+    unsigned char more;
+    long quat[4];
+
+    if (dmp_read_fifo(gyro, accel, quat, &sensor_timestamp, &sensors, &more))
+        return 1;
+
+    if (sensors & INV_WXYZ_QUAT) {
+        q0 = quat[0] / Q30;
+        q1 = quat[1] / Q30;
+        q2 = quat[2] / Q30;
+        q3 = quat[3] / Q30;
+
+        *p = asin(-2 * q1 * q3 + 2 * q0 * q2) * 57.3f;
+        *r = atan2(2 * q2 * q3 + 2 * q0 * q1, -2 * q1 * q1 - 2 * q2 * q2 + 1) * 57.3f;
+        *y = atan2(2 * (q1 * q2 + q0 * q3), q0 * q0 + q1 * q1 - q2 * q2 - q3 * q3) * 57.3f;
+    } else
+        return 2;
+
+    return 0;
 }
 
 /**
- * @brief  获取温度值函数
+ * @brief  获取陀螺仪原始数据
  */
-short MPU_Get_Temperature(void)
+uint8_t mpu6050_get_gyroscope(short *gx, short *gy, short *gz)
 {
-    uint8_t buf[2];
-    short raw;
-    float temp;
-    // 读取温度寄存器的高低 8 位
-    MPU_Read_Len(MPU_ADDR, MPU_TEMP_OUTH_REG, 2, buf);
-    // 组合 16 位原始数据
-    raw = ((uint16_t)buf[0] << 8) | buf[1];
-    // 转换为实际温度值（扩大 100 倍返回）
-    temp = 36.53 + ((double)raw) / 340;
-    return temp * 100;
+    uint8_t buf[6];
+    if (HAL_I2C_Mem_Read(&hi2c1, (MPU6050_ADDR << 1), MPU6050_GYRO_XOUTH_REG,
+                         I2C_MEMADD_SIZE_8BIT, buf, 6, HAL_MAX_DELAY) != HAL_OK)
+        return 1;
+    *gx = (buf[0] << 8) | buf[1];
+    *gy = (buf[2] << 8) | buf[3];
+    *gz = (buf[4] << 8) | buf[5];
+    return 0;
 }
 
 /**
- * @brief  获取陀螺仪原始数据函数
+ * @brief  获取加速度计原始数据
  */
-uint8_t MPU_Get_Gyroscope(short *gx, short *gy, short *gz)
+uint8_t mpu6050_get_accelerometer(short *ax, short *ay, short *az)
 {
-    uint8_t buf[6], res;
-    res = MPU_Read_Len(MPU_ADDR, MPU_GYRO_XOUTH_REG, 6, buf);
-    if (res == 0)
-    {
-        // 组合各轴的高低 8 位数据
-        *gx = ((uint16_t)buf[0] << 8) | buf[1];
-        *gy = ((uint16_t)buf[2] << 8) | buf[3];
-        *gz = ((uint16_t)buf[4] << 8) | buf[5];
-    }
-    return res;
+    uint8_t buf[6];
+    if (HAL_I2C_Mem_Read(&hi2c1, (MPU6050_ADDR << 1), MPU6050_ACCEL_XOUTH_REG,
+                         I2C_MEMADD_SIZE_8BIT, buf, 6, HAL_MAX_DELAY) != HAL_OK)
+        return 1;
+    *ax = (buf[0] << 8) | buf[1];
+    *ay = (buf[2] << 8) | buf[3];
+    *az = (buf[4] << 8) | buf[5];
+    return 0;
 }
 
 /**
- * @brief  获取加速度计原始数据函数
- */
-uint8_t MPU_Get_Accelerometer(short *ax, short *ay, short *az)
-{
-    uint8_t buf[6], res;
-    res = MPU_Read_Len(MPU_ADDR, MPU_ACCEL_XOUTH_REG, 6, buf);
-    if (res == 0)
-    {
-        // 组合各轴的高低 8 位数据
-        *ax = ((uint16_t)buf[0] << 8) | buf[1];
-        *ay = ((uint16_t)buf[2] << 8) | buf[3];
-        *az = ((uint16_t)buf[4] << 8) | buf[5];
-    }
-    return res;
-}
-
-/**
- * @brief  MPU6050 任务处理函数
- * 
- * @param  无
- * @return 无
+ * @brief  MPU6050 调度器周期任务
  */
 void mpu6050_task(void)
 {
-    // 获取姿态数据（欧拉角）
-    mpu_dmp_get_data(&pitch, &roll, &yaw);
-    // 获取加速度计数据
-    MPU_Get_Accelerometer(&aacx, &aacy, &aacz);
-    // 获取陀螺仪数据
-    MPU_Get_Gyroscope(&gyrox, &gyroy, &gyroz);
-    
-    // 计算加速度向量模值
+    mpu6050_dmp_get_data(&pitch, &roll, &yaw);
+    mpu6050_get_accelerometer(&aacx, &aacy, &aacz);
+    mpu6050_get_gyroscope(&gyrox, &gyroy, &gyroz);
+
     AVM = sqrt(pow(aacx, 2) + pow(aacy, 2) + pow(aacz, 2));
-    // 计算陀螺仪向量模值
     GVM = sqrt(pow(gyrox, 2) + pow(gyroy, 2) + pow(gyroz, 2));
-    
-    // 判断是否跌倒（ pitch 或 roll 超过 60 度）
+
     fall_flag = ((fabs(pitch) > 60) | (fabs(roll) > 60));
-    
-    // 打印姿态数据
+
     printf("pitch:%0.1f   roll:%0.1f   yaw:%0.1f\r\n", pitch, roll, yaw);
-}    
+}
