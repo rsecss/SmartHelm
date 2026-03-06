@@ -1049,16 +1049,6 @@
               <FilePath>..\APP\mpu6050.h</FilePath>
             </File>
             <File>
-              <FileName>mpu6050_dmp_key.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>..\APP\mpu6050_dmp_key.h</FilePath>
-            </File>
-            <File>
-              <FileName>mpu6050_dmp_map.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>..\APP\mpu6050_dmp_map.h</FilePath>
-            </File>
-            <File>
               <FileName>mpu6050_inv_mpu.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\APP\mpu6050_inv_mpu.c</FilePath>

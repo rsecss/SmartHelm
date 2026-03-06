@@ -17,6 +17,49 @@
 
 #include "mpu6050_inv_mpu_dmp_motion_driver.h"
 
+/* DMP instruction opcodes (from InvenSense dmp_key.h, only used macros) */
+#define DINA0C  0x0c
+#define DINA20  0x20
+#define DINA26  0x26
+#define DINA28  0x28
+#define DINA2C  0x2c
+#define DINA30  0x30
+#define DINA36  0x36
+#define DINA38  0x38
+#define DINA46  0x46
+#define DINA4C  0x4c
+#define DINA56  0x56
+#define DINA66  0x66
+#define DINA6C  0x6c
+#define DINA76  0x76
+#define DINA80  0x80
+#define DINA90  0x90
+#define DINAAA  0xaa
+#define DINAAB  0xab
+#define DINAC0  0xc0
+#define DINAC2  0xc2
+#define DINAC9  0xc9
+#define DINACD  0xcd
+#define DINADF  0xdf
+#define DINAF1  0xf1
+#define DINAF2  0xf2
+#define DINAFE  0xfe
+#define DINBC0  0xc0
+#define DINBC2  0xc2
+#define DINBC4  0xc4
+#define DINBC6  0xc6
+
+/* DMP memory map addresses (from InvenSense dmp_map.h, only used macros) */
+#define DMP_TAP_THX     (468)
+#define DMP_TAP_THY     (472)
+#define DMP_TAP_THZ     (476)
+#define DMP_TAPW_MIN    (478)
+
+/* Forward declarations for functions called before definition. */
+static int dmp_enable_gyro_cal(unsigned char enable);
+static int dmp_enable_lp_quat(unsigned char enable);
+static int dmp_enable_6x_lp_quat(unsigned char enable);
+
 /* The following functions must be defined for this platform:
  * i2c_write(unsigned char slave_addr, unsigned char reg_addr,
  *      unsigned char length, unsigned char const *data)
@@ -656,17 +699,6 @@ int dmp_set_fifo_rate(unsigned short rate)
 }
 
 /**
- *  @brief      Get DMP output rate.
- *  @param[out] rate    Current fifo rate (Hz).
- *  @return     0 if successful.
- */
-int dmp_get_fifo_rate(unsigned short *rate)
-{
-    rate[0] = dmp.fifo_rate;
-    return 0;
-}
-
-/**
  *  @brief      Set tap threshold for a specific axis.
  *  @param[in]  axis    1, 2, and 4 for XYZ accel, respectively.
  *  @param[in]  thresh  Tap threshold, in mg/ms.
@@ -856,81 +888,6 @@ int dmp_set_shake_reject_timeout(unsigned short time)
 }
 
 /**
- *  @brief      Get current step count.
- *  @param[out] count   Number of steps detected.
- *  @return     0 if successful.
- */
-int dmp_get_pedometer_step_count(unsigned long *count)
-{
-    unsigned char tmp[4];
-    if (!count)
-        return -1;
-
-    if (mpu_read_mem(D_PEDSTD_STEPCTR, 4, tmp))
-        return -1;
-
-    count[0] = ((unsigned long)tmp[0] << 24) | ((unsigned long)tmp[1] << 16) |
-        ((unsigned long)tmp[2] << 8) | tmp[3];
-    return 0;
-}
-
-/**
- *  @brief      Overwrite current step count.
- *  WARNING: This function writes to DMP memory and could potentially encounter
- *  a race condition if called while the pedometer is enabled.
- *  @param[in]  count   New step count.
- *  @return     0 if successful.
- */
-int dmp_set_pedometer_step_count(unsigned long count)
-{
-    unsigned char tmp[4];
-
-    tmp[0] = (unsigned char)((count >> 24) & 0xFF);
-    tmp[1] = (unsigned char)((count >> 16) & 0xFF);
-    tmp[2] = (unsigned char)((count >> 8) & 0xFF);
-    tmp[3] = (unsigned char)(count & 0xFF);
-    return mpu_write_mem(D_PEDSTD_STEPCTR, 4, tmp);
-}
-
-/**
- *  @brief      Get duration of walking time.
- *  @param[in]  time    Walk time in milliseconds.
- *  @return     0 if successful.
- */
-int dmp_get_pedometer_walk_time(unsigned long *time)
-{
-    unsigned char tmp[4];
-    if (!time)
-        return -1;
-
-    if (mpu_read_mem(D_PEDSTD_TIMECTR, 4, tmp))
-        return -1;
-
-    time[0] = (((unsigned long)tmp[0] << 24) | ((unsigned long)tmp[1] << 16) |
-        ((unsigned long)tmp[2] << 8) | tmp[3]) * 20;
-    return 0;
-}
-
-/**
- *  @brief      Overwrite current walk time.
- *  WARNING: This function writes to DMP memory and could potentially encounter
- *  a race condition if called while the pedometer is enabled.
- *  @param[in]  time    New walk time in milliseconds.
- */
-int dmp_set_pedometer_walk_time(unsigned long time)
-{
-    unsigned char tmp[4];
-
-    time /= 20;
-
-    tmp[0] = (unsigned char)((time >> 24) & 0xFF);
-    tmp[1] = (unsigned char)((time >> 16) & 0xFF);
-    tmp[2] = (unsigned char)((time >> 8) & 0xFF);
-    tmp[3] = (unsigned char)(time & 0xFF);
-    return mpu_write_mem(D_PEDSTD_TIMECTR, 4, tmp);
-}
-
-/**
  *  @brief      Enable DMP features.
  *  The following \#define's are used in the input mask:
  *  \n DMP_FEATURE_TAP
@@ -1065,17 +1022,6 @@ int dmp_enable_feature(unsigned short mask)
 }
 
 /**
- *  @brief      Get list of currently enabled DMP features.
- *  @param[out] Mask of enabled features.
- *  @return     0 if successful.
- */
-int dmp_get_enabled_features(unsigned short *mask)
-{
-    mask[0] = dmp.feature_mask;
-    return 0;
-}
-
-/**
  *  @brief      Calibrate the gyro data in the DMP.
  *  After eight seconds of no motion, the DMP will compute gyro biases and
  *  subtract them from the quaternion output. If @e dmp_enable_feature is
@@ -1084,7 +1030,7 @@ int dmp_get_enabled_features(unsigned short *mask)
  *  @param[in]  enable  1 to enable gyro calibration.
  *  @return     0 if successful.
  */
-int dmp_enable_gyro_cal(unsigned char enable)
+static int dmp_enable_gyro_cal(unsigned char enable)
 {
     if (enable) {
         unsigned char regs[9] = {0xb8, 0xaa, 0xb3, 0x8d, 0xb4, 0x98, 0x0d, 0x35, 0x5d};
@@ -1102,7 +1048,7 @@ int dmp_enable_gyro_cal(unsigned char enable)
  *  @param[in]  enable  1 to enable 3-axis quaternion.
  *  @return     0 if successful.
  */
-int dmp_enable_lp_quat(unsigned char enable)
+static int dmp_enable_lp_quat(unsigned char enable)
 {
     unsigned char regs[4];
     if (enable) {
@@ -1126,7 +1072,7 @@ int dmp_enable_lp_quat(unsigned char enable)
  *  @param[in]   enable  1 to enable 6-axis quaternion.
  *  @return      0 if successful.
  */
-int dmp_enable_6x_lp_quat(unsigned char enable)
+static int dmp_enable_6x_lp_quat(unsigned char enable)
 {
     unsigned char regs[4];
     if (enable) {
@@ -1168,34 +1114,6 @@ static int decode_gesture(unsigned char *gesture)
     }
 
     return 0;
-}
-
-/**
- *  @brief      Specify when a DMP interrupt should occur.
- *  A DMP interrupt can be configured to trigger on either of the two
- *  conditions below:
- *  \n a. One FIFO period has elapsed (set by @e mpu_set_sample_rate).
- *  \n b. A tap event has been detected.
- *  @param[in]  mode    DMP_INT_GESTURE or DMP_INT_CONTINUOUS.
- *  @return     0 if successful.
- */
-int dmp_set_interrupt_mode(unsigned char mode)
-{
-    const unsigned char regs_continuous[11] =
-        {0xd8, 0xb1, 0xb9, 0xf3, 0x8b, 0xa3, 0x91, 0xb6, 0x09, 0xb4, 0xd9};
-    const unsigned char regs_gesture[11] =
-        {0xda, 0xb1, 0xb9, 0xf3, 0x8b, 0xa3, 0x91, 0xb6, 0xda, 0xb4, 0xda};
-
-    switch (mode) {
-    case DMP_INT_CONTINUOUS:
-        return mpu_write_mem(CFG_FIFO_ON_EVENT, 11,
-            (unsigned char*)regs_continuous);
-    case DMP_INT_GESTURE:
-        return mpu_write_mem(CFG_FIFO_ON_EVENT, 11,
-            (unsigned char*)regs_gesture);
-    default:
-        return -1;
-    }
 }
 
 /**
@@ -1270,35 +1188,6 @@ int dmp_read_fifo(short *gyro, short *accel, long *quat,
         decode_gesture(fifo_data + ii);
 
     get_ms(timestamp);
-    return 0;
-}
-
-/**
- *  @brief      Register a function to be executed on a tap event.
- *  The tap direction is represented by one of the following:
- *  \n TAP_X_UP
- *  \n TAP_X_DOWN
- *  \n TAP_Y_UP
- *  \n TAP_Y_DOWN
- *  \n TAP_Z_UP
- *  \n TAP_Z_DOWN
- *  @param[in]  func    Callback function.
- *  @return     0 if successful.
- */
-int dmp_register_tap_cb(void (*func)(unsigned char, unsigned char))
-{
-    dmp.tap_cb = func;
-    return 0;
-}
-
-/**
- *  @brief      Register a function to be executed on a android orientation event.
- *  @param[in]  func    Callback function.
- *  @return     0 if successful.
- */
-int dmp_register_android_orient_cb(void (*func)(unsigned char))
-{
-    dmp.android_orient_cb = func;
     return 0;
 }
 
