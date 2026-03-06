@@ -19,6 +19,7 @@ jobs:
             --enable=warning,performance,portability \
             --error-exitcode=1 \
             --suppress=missingIncludeSystem \
+            --suppress=preprocessorErrorDirective \
             -DUSE_HAL_DRIVER -DSTM32F103xB \
             -I Core/Inc \
             -I Drivers/STM32F1xx_HAL_Driver/Inc \
